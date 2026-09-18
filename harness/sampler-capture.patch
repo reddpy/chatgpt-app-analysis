@@ -1,0 +1,79 @@
+// Guardian async-classifier capture hook
+// Patch target: codex-rs/ext/guardian-v2/src/async_scorer/sampler.rs
+// Adds an env-gated JSONL writer + an env-overridable classifier model.
+// Build: cargo build --ignore-rust-version -p codex-cli --bin codex
+
+// --- 1. ADD this free function at the end of the file (above `#[cfg(test)]`) ---
+fn guardian_capture(kind: &str, payload: serde_json::Value) {
+    let Some(path) = std::env::var_os("GUARDIAN_CAPTURE") else {
+        return;
+    };
+    use std::io::Write as _;
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let record = serde_json::json!({ "ts_ms": ts_ms, "kind": kind, "payload": payload });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+// --- 2. MODEL: keep the real const, make the request model env-overridable ---
+// pub(crate) const MODEL: &str = "gpt-5.6-luna";       // unchanged (line ~39)
+// In ResponsesApiRequest construction (line ~324):
+//   - model: MODEL.to_owned(),
+//   + model: std::env::var("GUARDIAN_MODEL").unwrap_or_else(|_| MODEL.to_owned()),
+
+// --- 3. CAPTURE the request right after the request struct is built (~line 345) ---
+        guardian_capture(
+            "request_built",
+            serde_json::json!({
+                "model": &request.model,
+                "prompt_cache_key": &request.prompt_cache_key,
+                "input": &request.input,
+            }),
+        );
+
+// --- 4. CAPTURE the full request (with client_metadata) just before streaming (~line 452) ---
+            guardian_capture(
+                "request",
+                serde_json::json!({
+                    "model": &request.model,
+                    "prompt_cache_key": &request.prompt_cache_key,
+                    "guardian_endpoint": lease.endpoint == ResponsesEndpoint::GuardianClassifier,
+                    "input": &request.input,
+                }),
+            );
+
+// --- 5. CAPTURE the verdict at both return points ---
+// (a) first-token early return (~line 511):
+                        guardian_capture(
+                            "verdict",
+                            serde_json::json!({
+                                "source": "output_text_delta",
+                                "classification": &delta,
+                                "thread_id": &self.config.thread_id,
+                            }),
+                        );
+                        return Ok(delta);
+// (b) buffered fallback (~line 527):
+                        if !output.is_empty() {
+                            guardian_capture(
+                                "verdict",
+                                serde_json::json!({
+                                    "source": "completed",
+                                    "classification": &output,
+                                    "thread_id": &self.config.thread_id,
+                                }),
+                            );
+                            return Ok(output);
+                        }
+
+// Verdict contract (extension.rs): "high" => (1.0, "high"), "low" => (0.0, "low"),
+// anything else => Err("invalid Guardian V2 classification"); on sampling failure
+// the score is fail-closed to action_risk = 1.0.
